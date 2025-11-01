@@ -23,108 +23,100 @@ function normalizeWa(raw) {
 
 // extrai o remetente REAL do payload do evolution
 function extractSender(body) {
-  // 1) tenta remoteJidAlt (no seu caso é o bom)
   const alt = body?.data?.key?.remoteJidAlt;
   if (alt) return normalizeWa(alt);
 
-  // 2) tenta sender (também vem certo)
   const sender = body?.sender;
   if (sender) return normalizeWa(sender);
 
-  // 3) por último, remoteJid (pode vir @lid)
   const rjid = body?.data?.key?.remoteJid;
   if (rjid) return normalizeWa(rjid);
 
   return "";
 }
 
-router.post("/webhook/MESSAGES_UPSERT", async (req, res) => {
-  // log bruto pra depurar
-  console.log("🔥 webhook recebido:", req.params.eventName || req.body?.event);
-  // console.log(JSON.stringify(req.body, null, 2));
+async function handleWebhook(req, res) {
+  const event = req.params.eventName || req.body?.event || "";
+  console.log("🔥 Webhook recebido:", event || "(sem evento)");
 
-  const event =
-    req.params.eventName /* /bot/webhook/messages.upsert */ ||
-    req.body?.event /* { event: 'messages.upsert' } */ ||
-    "";
+  // log inicial de debug
+  console.log(JSON.stringify(req.body, null, 2));
 
-  // a gente só quer tratar mensagens novas
   const isMessageUpsert =
     event.toLowerCase() === "messages.upsert" ||
-    event.toLowerCase() === "messages_upsert";
+    req.body?.event?.toLowerCase() === "messages.upsert";
 
   try {
-    // quem mandou?
     const fromNormalized = extractSender(req.body);
     const rawFrom =
       req.body?.data?.key?.remoteJidAlt ||
       req.body?.sender ||
       req.body?.data?.key?.remoteJid;
 
-    // texto da mensagem
     const text =
       req.body?.data?.message?.conversation ||
       req.body?.data?.message?.extendedTextMessage?.text ||
       "";
 
-    console.log("📞 rawFrom:", rawFrom);
-    console.log("📞 fromNormalized:", fromNormalized);
-    console.log("💬 text:", text);
+    console.log("📞 De:", rawFrom, "| Normalizado:", fromNormalized);
+    console.log("💬 Mensagem:", text);
 
-    // valida whitelist
+    // se não for mensagem nova, ignora
+    if (!isMessageUpsert) {
+      console.log("⚪ Evento ignorado:", event);
+      return res.json({ ok: true, ignored: true });
+    }
+
+    // valida número
     const isAllowed =
       botAllowedNumbers.length === 0 ||
       botAllowedNumbers.includes(fromNormalized);
 
     if (!isAllowed) {
-      console.log("⛔ número não autorizado:", fromNormalized);
-      try {
-        await sendText(
-          rawFrom,
-          "👋 Este bot é restrito. Fale com o administrador para liberar seu número."
-        );
-      } catch (e) {
-        console.error("erro ao responder não autorizado:", e.message);
-      }
+      console.log("⛔ Número não autorizado:", fromNormalized);
+      await sendText(
+        rawFrom,
+        "👋 Este bot é restrito. Fale com o administrador para liberar seu número."
+      );
       return res.json({ ok: false, reason: "unauthorized" });
     }
 
-    // se não for evento de mensagem, ignora
-    if (!isMessageUpsert) {
-      return res.json({ ok: true, ignored: true, event });
-    }
+    const msg = String(text || "")
+      .trim()
+      .toLowerCase();
 
-    const msg = String(text || "").trim();
-
-    // 1) se for link da Shopee → fila
+    // ------------------------- caso 1: link da Shopee -------------------------
     if (msg.includes("shopee.com")) {
+      console.log("🛒 Link Shopee detectado:", msg);
       const offer = await buildOfferFromLink(msg);
       if (offer) {
         addToQueue(offer);
         await sendText(
           rawFrom,
-          "✅ Oferta adicionada à fila. Ela vai sair no próximo envio automático."
+          "✅ Oferta adicionada à fila. Ela será enviada no próximo envio automático."
         );
         return res.json({ ok: true, type: "link", queued: true });
       } else {
         await sendText(
           rawFrom,
-          "❌ Não consegui ler esse link da Shopee. Confere se é um link de produto."
+          "❌ Não consegui ler esse link da Shopee. Confirme se é um link válido de produto."
         );
         return res.json({ ok: false, type: "link", queued: false });
       }
     }
 
-    // 2) se for "ofertas xxx"
-    if (msg.toLowerCase().startsWith("ofertas ")) {
-      const keyword = msg.substring(8).trim();
+    // ------------------------- caso 2: ofertas <keyword> -------------------------
+    if (msg.startsWith("ofertas ")) {
+      const keyword = msg.replace("ofertas ", "").trim();
       if (!keyword) {
         await sendText(
           rawFrom,
-          "me manda assim 👉 *ofertas maquiagem* ou *ofertas roupa feminina*"
+          "Envie algo como 👉 *ofertas maquiagem* ou *ofertas roupa feminina*"
         );
         return res.json({ ok: false, reason: "empty_keyword" });
       }
+
+      console.log("🔍 Buscando ofertas para:", keyword);
 
       const data = await getOffers({
         keyword,
@@ -136,16 +128,14 @@ router.post("/webhook/MESSAGES_UPSERT", async (req, res) => {
       if (!data.offers.length) {
         await sendText(
           rawFrom,
-          `❌ Não encontrei ofertas para *${keyword}*. Tenta outro termo.`
+          `❌ Não encontrei ofertas para *${keyword}*. Tente outro termo.`
         );
         return res.json({ ok: true, type: "keyword", found: 0 });
       }
 
-      // responde no whatsapp
       const waMsg = formatOffersMessage(keyword, data.offers);
       await sendText(rawFrom, waMsg);
 
-      // dispara pro n8n se tiver
       if (n8nWebhookUrl) {
         try {
           await axios.post(
@@ -160,7 +150,7 @@ router.post("/webhook/MESSAGES_UPSERT", async (req, res) => {
             { timeout: 5000 }
           );
         } catch (e) {
-          console.error("erro ao chamar n8n:", e.message);
+          console.error("❌ Erro ao chamar N8N:", e.message);
         }
       }
 
@@ -172,24 +162,29 @@ router.post("/webhook/MESSAGES_UPSERT", async (req, res) => {
       });
     }
 
-    // 3) fallback
+    // ------------------------- fallback -------------------------
     await sendText(
       rawFrom,
       [
-        "oi 👋",
-        "pra buscar ofertas me manda:",
+        "👋 Olá!",
+        "",
+        "Para buscar ofertas me envie:",
         "👉 *ofertas maquiagem*",
         "👉 *ofertas roupa feminina*",
         "",
-        "pra salvar uma oferta manual me manda o *link da Shopee*",
+        "Ou envie um *link da Shopee* para adicionar manualmente.",
       ].join("\n")
     );
 
     return res.json({ ok: true, type: "fallback" });
   } catch (err) {
-    console.error("ERR /bot/webhook:", err);
+    console.error("❌ ERRO /bot/webhook:", err);
     return res.status(500).json({ error: true, message: err.message });
   }
-});
+}
+
+// define ambas rotas sem “?”
+router.post("/webhook", handleWebhook);
+router.post("/webhook/:eventName", handleWebhook);
 
 module.exports = router;
