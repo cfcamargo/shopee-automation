@@ -38,7 +38,7 @@ function extractSender(body) {
   return "";
 }
 
-router.post("/webhook/:eventName?", async (req, res) => {
+router.post("/webhook/:eventName", async (req, res) => {
   // log bruto pra depurar
   console.log("🔥 webhook recebido:", req.params.eventName || req.body?.event);
   // console.log(JSON.stringify(req.body, null, 2));

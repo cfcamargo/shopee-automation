@@ -27,7 +27,6 @@ async function sendText(to, text) {
 
   if (evolution.token) {
     headers["apikey"] = evolution.token;
-    // ou Authorization, se o teu precisar
   }
 
   const { data } = await axios.post(url, payload, {
