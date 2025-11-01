@@ -20,6 +20,7 @@ function normalizeWaNumber(raw) {
 }
 
 router.post("/webhook", async (req, res) => {
+  console.log(req.body);
   try {
     const { text = "", from = "" } = req.body || {};
     const msg = String(text).trim();
