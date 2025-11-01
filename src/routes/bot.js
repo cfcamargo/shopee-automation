@@ -10,82 +10,109 @@ const {
 
 const router = express.Router();
 
-// normaliza "5511999999999@c.us" -> "5511999999999"
-function normalizeWaNumber(raw) {
+// normaliza número vindo de várias formas
+function normalizeWa(raw) {
   if (!raw) return "";
   return String(raw)
+    .replace(/@s\.whatsapp\.net$/i, "")
     .replace(/@c\.us$/i, "")
     .replace(/@g\.us$/i, "")
+    .replace(/@lid$/i, "")
     .trim();
 }
 
-router.post("/webhook", async (req, res) => {
-  console.log(req.body);
-  try {
-    const { text = "", from = "" } = req.body || {};
-    const msg = String(text).trim();
-    const fromNormalized = normalizeWaNumber(from);
+// extrai o remetente REAL do payload do evolution
+function extractSender(body) {
+  // 1) tenta remoteJidAlt (no seu caso é o bom)
+  const alt = body?.data?.key?.remoteJidAlt;
+  if (alt) return normalizeWa(alt);
 
+  // 2) tenta sender (também vem certo)
+  const sender = body?.sender;
+  if (sender) return normalizeWa(sender);
+
+  // 3) por último, remoteJid (pode vir @lid)
+  const rjid = body?.data?.key?.remoteJid;
+  if (rjid) return normalizeWa(rjid);
+
+  return "";
+}
+
+router.post("/webhook/:eventName?", async (req, res) => {
+  // log bruto pra depurar
+  console.log("🔥 webhook recebido:", req.params.eventName || req.body?.event);
+  // console.log(JSON.stringify(req.body, null, 2));
+
+  const event =
+    req.params.eventName /* /bot/webhook/messages.upsert */ ||
+    req.body?.event /* { event: 'messages.upsert' } */ ||
+    "";
+
+  // a gente só quer tratar mensagens novas
+  const isMessageUpsert =
+    event.toLowerCase() === "messages.upsert" ||
+    event.toLowerCase() === "messages_upsert";
+
+  try {
+    // quem mandou?
+    const fromNormalized = extractSender(req.body);
+    const rawFrom =
+      req.body?.data?.key?.remoteJidAlt ||
+      req.body?.sender ||
+      req.body?.data?.key?.remoteJid;
+
+    // texto da mensagem
+    const text =
+      req.body?.data?.message?.conversation ||
+      req.body?.data?.message?.extendedTextMessage?.text ||
+      "";
+
+    console.log("📞 rawFrom:", rawFrom);
+    console.log("📞 fromNormalized:", fromNormalized);
+    console.log("💬 text:", text);
+
+    // valida whitelist
     const isAllowed =
       botAllowedNumbers.length === 0 ||
       botAllowedNumbers.includes(fromNormalized);
 
     if (!isAllowed) {
+      console.log("⛔ número não autorizado:", fromNormalized);
       try {
         await sendText(
-          from,
-          "👋 Olá! Este bot está restrito. Se você precisa de acesso, fale com o administrador. 😉"
+          rawFrom,
+          "👋 Este bot é restrito. Fale com o administrador para liberar seu número."
         );
       } catch (e) {
-        console.error(
-          "erro ao responder usuário não autorizado:",
-          fromNormalized
-        );
+        console.error("erro ao responder não autorizado:", e.message);
       }
-
-      return res.status(200).json({
-        ok: false,
-        reason: "unauthorized_sender",
-      });
+      return res.json({ ok: false, reason: "unauthorized" });
     }
 
-    // 1) se for um link da Shopee → vai pra fila
+    // se não for evento de mensagem, ignora
+    if (!isMessageUpsert) {
+      return res.json({ ok: true, ignored: true, event });
+    }
+
+    const msg = String(text || "").trim();
+
+    // 1) se for link da Shopee → fila
     if (msg.includes("shopee.com")) {
       const offer = await buildOfferFromLink(msg);
       if (offer) {
         addToQueue(offer);
-
-        try {
-          await sendText(
-            from,
-            "✅ Oferta adicionada à fila. Ela vai sair no próximo envio automático."
-          );
-        } catch (e) {
-          console.error("erro ao responder no WA:", e.message);
-        }
-
-        return res.json({
-          ok: true,
-          type: "link",
-          message: "Oferta adicionada à fila.",
-          offer,
-        });
-      }
-
-      try {
         await sendText(
-          from,
+          rawFrom,
+          "✅ Oferta adicionada à fila. Ela vai sair no próximo envio automático."
+        );
+        return res.json({ ok: true, type: "link", queued: true });
+      } else {
+        await sendText(
+          rawFrom,
           "❌ Não consegui ler esse link da Shopee. Confere se é um link de produto."
         );
-      } catch (e) {
-        console.error("erro ao responder no WA:", e.message);
+        return res.json({ ok: false, type: "link", queued: false });
       }
-
-      return res.json({
-        ok: false,
-        type: "link",
-        message: "Não consegui ler esse link da Shopee.",
-      });
     }
 
     // 2) se for "ofertas xxx"
@@ -93,14 +120,10 @@ router.post("/webhook", async (req, res) => {
       const keyword = msg.substring(8).trim();
       if (!keyword) {
         await sendText(
-          from,
+          rawFrom,
           "me manda assim 👉 *ofertas maquiagem* ou *ofertas roupa feminina*"
         );
-        return res.json({
-          ok: false,
-          type: "keyword",
-          message: "keyword vazia",
-        });
+        return res.json({ ok: false, reason: "empty_keyword" });
       }
 
       const data = await getOffers({
@@ -112,47 +135,46 @@ router.post("/webhook", async (req, res) => {
 
       if (!data.offers.length) {
         await sendText(
-          from,
+          rawFrom,
           `❌ Não encontrei ofertas para *${keyword}*. Tenta outro termo.`
         );
-        return res.json({
-          ok: true,
-          type: "keyword",
-          message: `não encontrei ofertas para ${keyword}`,
-        });
+        return res.json({ ok: true, type: "keyword", found: 0 });
       }
 
-      const waMsg = formatOffersMessage(keyword);
-      await sendText(from, waMsg);
+      // responde no whatsapp
+      const waMsg = formatOffersMessage(keyword, data.offers);
+      await sendText(rawFrom, waMsg);
 
+      // dispara pro n8n se tiver
       if (n8nWebhookUrl) {
         try {
           await axios.post(
             n8nWebhookUrl,
             {
               source: "shopee-bot",
+              from: rawFrom,
+              fromNormalized,
               keyword,
               offers: data.offers,
-              from,
             },
             { timeout: 5000 }
           );
         } catch (e) {
-          console.error("Erro ao chamar n8n:", e.message);
+          console.error("erro ao chamar n8n:", e.message);
         }
       }
 
       return res.json({
         ok: true,
         type: "keyword",
-        message: `enviado para ${from}`,
+        sentTo: rawFrom,
         total: data.offers.length,
       });
     }
 
     // 3) fallback
     await sendText(
-      from,
+      rawFrom,
       [
         "oi 👋",
         "pra buscar ofertas me manda:",
@@ -163,17 +185,10 @@ router.post("/webhook", async (req, res) => {
       ].join("\n")
     );
 
-    return res.json({
-      ok: true,
-      type: "unknown",
-      message: "comando desconhecido",
-    });
+    return res.json({ ok: true, type: "fallback" });
   } catch (err) {
     console.error("ERR /bot/webhook:", err);
-    return res.status(500).json({
-      error: true,
-      message: err.message,
-    });
+    return res.status(500).json({ error: true, message: err.message });
   }
 });
 
