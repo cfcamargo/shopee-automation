@@ -1,4 +1,3 @@
-// src/routes/bot.js
 const express = require("express");
 const axios = require("axios");
 const { getOffers, buildOfferFromLink } = require("../services/shopeeService");
