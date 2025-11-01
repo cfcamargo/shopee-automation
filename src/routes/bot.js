@@ -36,7 +36,10 @@ router.post("/webhook", async (req, res) => {
           "👋 Olá! Este bot está restrito. Se você precisa de acesso, fale com o administrador. 😉"
         );
       } catch (e) {
-        console.error("erro ao responder usuário não autorizado:", e.message);
+        console.error(
+          "erro ao responder usuário não autorizado:",
+          fromNormalized
+        );
       }
 
       return res.status(200).json({
