@@ -1,161 +1,34 @@
 // src/services/shopeeService.js
+
 const axios = require("axios");
 const crypto = require("crypto");
-const { shopee } = require("../config");
-const { flushQueue } = require("./queueService");
+const { shopee } = require("../config"); // Importa chaves e URL GQL
+const { generatePersuasiveCopy } = require("./geminiService")
 
-// -----------------------------------------------------------------------------
-// helpers
-// -----------------------------------------------------------------------------
+
 function sha256(str) {
   return crypto.createHash("sha256").update(str).digest("hex");
 }
 
-// interno pra filtro/score
-function rateToPctInternal(rateStr) {
-  if (rateStr === undefined || rateStr === null || rateStr === "") return 0;
-  const n = Number(rateStr);
-  if (!isFinite(n) || n < 0) return 0;
-  // ⚠️ Shopee BR costuma mandar "0.25" para 2,5% → usamos x10
-  // se vier "5" ou "12" (já em %) a gente mantém
-  return n <= 1 ? n * 10 : n;
-}
 
-// extrai shopId e itemId de https://shopee.com.br/...-i.<shopId>.<itemId>
-function extractShopAndItemFromLink(link) {
-  if (!link) return null;
-  const m = link.match(/-i\.(\d+)\.(\d+)/);
-  if (!m) return null;
-  return { shopId: Number(m[1]), itemId: Number(m[2]) };
-}
-
-// pega dados públicos da Shopee (pra saber se é BR e/ou pegar catid do site)
-async function fetchPublicItem(shopId, itemId) {
-  const url = `https://shopee.com.br/api/v4/item/get?itemid=${itemId}&shopid=${shopId}`;
-  const { data } = await axios.get(url, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      Referer: "https://shopee.com.br/",
-      Accept: "application/json",
-    },
-    timeout: 8000,
-  });
-  return data && data.item ? data.item : null;
-}
-
-// filtra por BR e/ou por categoria do SITE (id grandão tipo 11059998)
-async function filterByPublicData(
-  items,
-  { localOnly, siteCatId },
-  maxParallel = 5
-) {
-  if (!localOnly && !siteCatId) return items;
-
-  const result = [];
-
-  for (let i = 0; i < items.length; i += maxParallel) {
-    const slice = items.slice(i, i + maxParallel);
-
-    const checked = await Promise.all(
-      slice.map(async (it) => {
-        const parsed =
-          extractShopAndItemFromLink(it.offerLink) ||
-          extractShopAndItemFromLink(it.productLink);
-        if (!parsed) return null;
-
-        let publicItem;
-        try {
-          publicItem = await fetchPublicItem(parsed.shopId, parsed.itemId);
-        } catch (e) {
-          return null;
-        }
-        if (!publicItem) return null;
-
-        // filtro BR
-        if (localOnly) {
-          const loc =
-            publicItem.shop_location ||
-            publicItem.shop_loc ||
-            publicItem.region ||
-            publicItem.country ||
-            "";
-          const locNorm = String(loc).toLowerCase();
-          const isBR =
-            locNorm.includes("brasil") ||
-            locNorm === "br" ||
-            locNorm.endsWith(" br") ||
-            locNorm.includes(", br");
-          if (!isBR) return null;
-        }
-
-        // filtro por categoria do SITE (idão da URL)
-        if (siteCatId) {
-          const catid = publicItem.catid;
-          if (Number(catid) !== Number(siteCatId)) return null;
-        }
-
-        return it;
-      })
-    );
-
-    checked.forEach((ok) => ok && result.push(ok));
-  }
-
-  return result;
-}
-
-// -----------------------------------------------------------------------------
-// função principal: busca ofertas
-// -----------------------------------------------------------------------------
-async function getOffers(params = {}) {
-  // coerção defensiva (rota pode ter passado string)
+async function getProductOffers(params = {}) {
+  // Coerção e Default de Parâmetros
   const keyword = params.keyword ? String(params.keyword).trim() : null;
-  const rawCat =
-    params.productCatId || params.categoryId || params.catId || null;
-
+  const productCatId = params.productCatId ? Number(params.productCatId) : null;
+  const sortType = params.sortType ? Number(params.sortType) : 1; // 1 = RELEVANCE_DESC
   const page = params.page ? Number(params.page) : 1;
-  const limit = params.limit ? Number(params.limit) : 50;
+  const limit = params.limit ? Number(params.limit) : 10;
 
-  const minDiscount = params.minDiscount ? Number(params.minDiscount) : 0;
-  const minCommission = params.minCommission ? Number(params.minCommission) : 5;
-  const minSales = params.minSales ? Number(params.minSales) : 1;
+  // Parâmetros opcionais/avançados (usamos '??' para default, '||' para coerção booleana)
+  const isAMSOffer = params.isAMSOffer === true || params.isAMSOffer === 'true' ? true : null;
+  const isKeySeller = params.isKeySeller === true || params.isKeySeller === 'true' ? true : null;
+  // shopId, itemId, listType, matchId, etc., podem ser passados via params se necessários
 
-  const wSales = params.wSales ? Number(params.wSales) : 0.45;
-  const wComm = params.wComm ? Number(params.wComm) : 0.35;
-  const wDisc = params.wDisc ? Number(params.wDisc) : 0.15;
-  const wRate = params.wRate ? Number(params.wRate) : 0.05;
+  // 1. Monta a Query GQL
+  const vars = ["$sortType: Int!", "$page: Int!", "$limit: Int!"];
+  const args = ["sortType: $sortType", "page: $page", "limit: $limit"];
 
-  const sortType = params.sortType ? Number(params.sortType) : 5;
-
-  const extraOnly =
-    params.extraOnly === true ||
-    params.extraOnly === "true" ||
-    params.extraOnly === 1 ||
-    params.extraOnly === "1";
-
-  const localOnly =
-    params.localOnly === true ||
-    params.localOnly === "true" ||
-    params.localOnly === 1 ||
-    params.localOnly === "1";
-
-  // normaliza categoria (doc x site)
-  let productCatId = null;
-  let siteCatId = null;
-  if (rawCat) {
-    const n = Number(rawCat);
-    if (n > 1_000_000) {
-      siteCatId = n;
-    } else {
-      productCatId = n;
-    }
-  }
-
-  // monta query gql
-  const vars = [];
-  const args = [];
-
+  // Adiciona variáveis e argumentos se existirem
   if (keyword) {
     vars.push("$keyword: String!");
     args.push("keyword: $keyword");
@@ -164,13 +37,15 @@ async function getOffers(params = {}) {
     vars.push("$productCatId: Int!");
     args.push("productCatId: $productCatId");
   }
-
-  vars.push("$sortType: Int!");
-  vars.push("$page: Int!");
-  vars.push("$limit: Int!");
-  args.push("sortType: $sortType");
-  args.push("page: $page");
-  args.push("limit: $limit");
+  if (isAMSOffer !== null) {
+    vars.push("$isAMSOffer: Boolean!");
+    args.push("isAMSOffer: $isAMSOffer");
+  }
+  if (isKeySeller !== null) {
+    vars.push("$isKeySeller: Boolean!");
+    args.push("isKeySeller: $isKeySeller");
+  }
+  // Adicionar outros parâmetros (shopId, itemId, listType, etc.) se forem passados
 
   const query = `
     query GetProductOfferV2(${vars.join(", ")}) {
@@ -185,11 +60,9 @@ async function getOffers(params = {}) {
           ratingStar
           commissionRate
           sellerCommissionRate
-          shopeeCommissionRate
           priceMin
           priceMax
           priceDiscountRate
-          productCatIds
           shopId
         }
         pageInfo {
@@ -201,216 +74,24 @@ async function getOffers(params = {}) {
     }
   `;
 
+  // 2. Monta as Variáveis
   const variables = {
     ...(keyword ? { keyword } : {}),
     ...(productCatId ? { productCatId } : {}),
+    ...(isAMSOffer !== null ? { isAMSOffer } : {}),
+    ...(isKeySeller !== null ? { isKeySeller } : {}),
     sortType,
     page,
     limit,
   };
 
+  // 3. Autenticação (SHA256)
   const body = JSON.stringify({ query, variables });
   const ts = Math.floor(Date.now() / 1000).toString();
   const signature = sha256(shopee.appId + ts + body + shopee.secret);
   const Authorization = `SHA256 Credential=${shopee.appId}, Timestamp=${ts}, Signature=${signature}`;
 
-  const resp = await axios.post(shopee.gqlUrl, body, {
-    headers: {
-      "Content-Type": "application/json",
-      "Accept-Encoding": "identity",
-      Authorization,
-    },
-    timeout: 12000,
-  });
-
-  if (resp.data?.errors?.length) {
-    throw new Error(JSON.stringify(resp.data.errors));
-  }
-
-  const conn = resp.data?.data?.productOfferV2;
-  let nodes = Array.isArray(conn?.nodes) ? conn.nodes.filter(Boolean) : [];
-
-  // ----------------- enrich -----------------
-  let enriched = nodes.map((p) => {
-    const nPriceMin = Number(p.priceMin || 0);
-    const nPriceMax = Number(p.priceMax || 0);
-
-    // desconto
-    let discountPct = null;
-    if (nPriceMax > nPriceMin && nPriceMin > 0) {
-      discountPct = Math.round((1 - nPriceMin / nPriceMax) * 100);
-    } else if (p.priceDiscountRate != null) {
-      discountPct = Number(p.priceDiscountRate);
-    }
-
-    // valores crus pra devolver
-    const rawCommissionRate = p.commissionRate ?? "";
-    const rawSellerCommissionRate = p.sellerCommissionRate ?? "";
-    const rawShopeeCommissionRate = p.shopeeCommissionRate ?? "";
-
-    // convertidos pra filtro
-    const commissionPct = rateToPctInternal(rawCommissionRate);
-    const sellerXtraPct = rateToPctInternal(rawSellerCommissionRate);
-    const shopeePct = rateToPctInternal(rawShopeeCommissionRate);
-
-    const finalCommissionPct =
-      commissionPct > 0 ? commissionPct : sellerXtraPct + shopeePct;
-
-    const rating = Number(p.ratingStar || 0);
-    const sales = Number(p.sales || 0);
-
-    const score =
-      wSales * Math.log1p(Math.max(0, sales)) +
-      wComm * (finalCommissionPct || 0) +
-      wDisc * (discountPct || 0) +
-      wRate * (rating * 20);
-
-    return {
-      id: p.itemId,
-      title: p.productName,
-      price: nPriceMin,
-      oldPrice: nPriceMax > 0 ? nPriceMax : null,
-      discount: discountPct,
-      imageUrl: p.imageUrl || null,
-      offerLink: p.offerLink || p.productLink || null,
-      productLink: p.productLink || null,
-      productCatIds: Array.isArray(p.productCatIds) ? p.productCatIds : [],
-      metrics: {
-        sales,
-        rating,
-        rawCommissionRate,
-        rawSellerCommissionRate,
-        rawShopeeCommissionRate,
-        finalCommissionPct,
-        sellerXtraPct,
-      },
-      score,
-    };
-  });
-
-  // ----------------- filtros baratos -----------------
-  enriched = enriched.filter(
-    (x) =>
-      x.offerLink &&
-      x.metrics.sales >= minSales &&
-      (x.metrics.finalCommissionPct || 0) >= minCommission &&
-      (x.discount || 0) >= minDiscount
-  );
-
-  // remove produtos sem desconto real
-  enriched = enriched.filter((x) => {
-    if (!x.oldPrice) return true;
-    if (!x.price && x.price !== 0) return true;
-    return x.price < x.oldPrice;
-  });
-
-  // reforça categoria da DOC se a Shopee tiver ignorado
-  if (productCatId) {
-    enriched = enriched.filter((x) => x.productCatIds.includes(productCatId));
-  }
-
-  // só “comissão extra”
-  if (extraOnly) {
-    enriched = enriched.filter((x) => (x.metrics.sellerXtraPct || 0) > 0);
-  }
-
-  // BR e/ou categoria do site
-  if (localOnly || siteCatId) {
-    enriched = await filterByPublicData(enriched, { localOnly, siteCatId }, 5);
-  }
-
-  // ordena
-  const ranked = enriched.sort((a, b) => b.score - a.score);
-
-  // pega fila (ofertas manuais)
-  const queued = flushQueue(); // sempre devolve e limpa
-
-  // monta resposta final
-  const offers = [...queued, ...ranked.slice(0, limit)].map((o) => ({
-    title: o.title,
-    price: o.price,
-    oldPrice: o.oldPrice,
-    discount: o.discount,
-    imageUrl: o.imageUrl,
-    offerLink: o.offerLink,
-    productLink: o.productLink,
-    productCatIds: o.productCatIds,
-    sales: o.metrics?.sales ?? o.sales ?? 0,
-    rating: o.metrics?.rating ?? o.rating ?? 0,
-    // devolvendo exatamente como a Shopee manda
-    commissionRate: o.metrics?.rawCommissionRate ?? o.commissionRate ?? "",
-    sellerCommissionRate:
-      o.metrics?.rawSellerCommissionRate ?? o.sellerCommissionRate ?? "",
-    shopeeCommissionRate:
-      o.metrics?.rawShopeeCommissionRate ?? o.shopeeCommissionRate ?? "",
-    score: Number((o.score ?? 0).toFixed ? o.score.toFixed(2) : o.score ?? 0),
-  }));
-
-  return {
-    offers,
-    pageInfo: conn?.pageInfo || null,
-    applied: {
-      keyword,
-      productCatId,
-      siteCatId,
-      sortType,
-      page,
-      limit,
-      minDiscount,
-      minCommission,
-      minSales,
-      extraOnly,
-      localOnly,
-      weights: { wSales, wComm, wDisc, wRate },
-    },
-  };
-}
-
-// -----------------------------------------------------------------------------
-// pegar oferta por LINK e transformar num item de fila
-// -----------------------------------------------------------------------------
-async function buildOfferFromLink(link) {
-  const parsed = extractShopAndItemFromLink(link);
-  if (!parsed) return null;
-
-  const item = await fetchPublicItem(parsed.shopId, parsed.itemId);
-  if (!item) return null;
-
-  const query = `
-    query GetProductOfferV2($itemId: Int!, $sortType: Int!, $page: Int!, $limit: Int!) {
-      productOfferV2(
-        itemId: $itemId,
-        sortType: $sortType,
-        page: $page,
-        limit: $limit
-      ) {
-        nodes {
-          offerLink
-          productLink
-          commissionRate
-          sellerCommissionRate
-          shopeeCommissionRate
-        }
-      }
-    }
-  `;
-  const variables = {
-    itemId: Number(parsed.itemId),
-    sortType: 5,
-    page: 1,
-    limit: 1,
-  };
-
-  const body = JSON.stringify({ query, variables });
-  const ts = Math.floor(Date.now() / 1000).toString();
-  const signature = sha256(shopee.appId + ts + body + shopee.secret);
-  const Authorization = `SHA256 Credential=${shopee.appId}, Timestamp=${ts}, Signature=${signature}`;
-
-  let offerLink = null;
-  let commissionRate = "";
-  let sellerCommissionRate = "";
-  let shopeeCommissionRate = "";
-
+  // 4. Requisição
   try {
     const resp = await axios.post(shopee.gqlUrl, body, {
       headers: {
@@ -418,47 +99,85 @@ async function buildOfferFromLink(link) {
         "Accept-Encoding": "identity",
         Authorization,
       },
-      timeout: 10000,
+      timeout: 12000,
     });
-    const node = resp.data?.data?.productOfferV2?.nodes?.[0];
-    if (node) {
-      offerLink = node.offerLink || null;
-      commissionRate = node.commissionRate ?? "";
-      sellerCommissionRate = node.sellerCommissionRate ?? "";
-      shopeeCommissionRate = node.shopeeCommissionRate ?? "";
+
+    if (resp.data?.errors?.length) {
+      throw new Error(JSON.stringify(resp.data.errors));
     }
-  } catch (e) {
-    // se falhar, a gente segue com o link puro
+
+    const conn = resp.data?.data?.productOfferV2;
+    let nodes = Array.isArray(conn?.nodes) ? conn.nodes.filter(Boolean) : [];
+
+    nodes = nodes.filter(p => {
+        const priceMin = Number(p.priceMin || 0);
+        const priceMax = Number(p.priceMax || 0);
+
+        if (priceMin < priceMax) {
+            return true;
+        }
+
+        if (Number(p.priceDiscountRate || 0) > 0) {
+            return true;
+        }
+  
+        return false;
+    });
+
+    const offersPromises = nodes.map(async (p) => {
+      const priceMin = Number(p.priceMin || 0);
+      const priceMax = Number(p.priceMax || 0);
+      
+      // Chama o Gemini, esperando o resultado
+      // const copyOffer = await generatePersuasiveCopy(p); 
+
+      return {
+        id: p.itemId,
+        title: copyOffer?.titulo ?? p.productName,
+        price: priceMin.toFixed(2),
+        oldPrice: priceMax > priceMin ? priceMax.toFixed(2) : null,
+        discountRate: p.priceDiscountRate,
+        imageUrl: p.imageUrl,
+        offerLink: p.offerLink || p.productLink,
+        sales: p.sales || 0,
+        rating: p.ratingStar || 0,
+        commissionRate: p.commissionRate,
+        sellerCommissionRate: p.sellerCommissionRate,
+        shopId: p.shopId,
+        copy: copyOffer.copy ?? ''
+      };
+    });
+
+    // 2. Esperar que todas as Promises sejam resolvidas
+    const offers = await Promise.all(offersPromises);
+
+    console.log(offers)
+
+    return {
+      offers,
+      pageInfo: conn?.pageInfo || null,
+      applied: { keyword, productCatId, sortType, page, limit, isAMSOffer, isKeySeller },
+    };
+  } catch (error) {
+    console.error("Erro na Requisição GQL Shopee (Product Offer V2):", error.message);
+    throw new Error(`Erro ao buscar ofertas de produto: ${error.message}`);
   }
-
-  // API pública costuma vir em "preço * 100000" mesmo, vamos proteger
-  const safePriceFromPublic =
-    typeof item.price === "number" && item.price > 0
-      ? item.price / 100000
-      : null;
-
-  return {
-    title: item.name,
-    price: safePriceFromPublic,
-    oldPrice: null,
-    discount: null,
-    imageUrl:
-      item.images && item.images.length
-        ? `https://cf.shopee.com.br/file/${item.images[0]}`
-        : null,
-    offerLink: offerLink || link,
-    productLink: link,
-    productCatIds: item.categories || [],
-    sales: item.historical_sold || 0,
-    rating: item.item_rating?.rating_star || 0,
-    commissionRate,
-    sellerCommissionRate,
-    shopeeCommissionRate,
-  };
 }
 
 module.exports = {
-  getOffers,
-  buildOfferFromLink,
-  extractShopAndItemFromLink,
+  getProductOffers
 };
+
+// itemId: 25885369912,
+//   productName: 'Paleta De Sombras De 9 Cores De Chocolate – Marrom Brilhante , Fosco E Neutro , Multiuso , Adequado Para Orçamento',
+//   imageUrl: 'https://cf.shopee.com.br/file/sg-11134201-821f1-mgz8dkqf3dvt6a',
+//   productLink: 'https://shopee.com.br/product/1006215031/25885369912',
+//   offerLink: 'https://s.shopee.com.br/7KpBgC6Eck',
+//   sales: 463,
+//   ratingStar: '4.8',
+//   commissionRate: '0.07',
+//   sellerCommissionRate: '0.04',
+//   priceMin: '10.09',
+//   priceMax: '10.09',
+//   priceDiscountRate: 42,
+//   shopId: 1006215031

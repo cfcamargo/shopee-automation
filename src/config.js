@@ -13,7 +13,7 @@ function parseWhitelist(str) {
 }
 
 module.exports = {
-  port: process.env.PORT || 3000,
+  port: process.env.PORT || 3333,
   shopee: {
     appId: process.env.SHOPEE_APP_ID,
     secret: process.env.SHOPEE_APP_SECRET,
@@ -24,6 +24,9 @@ module.exports = {
     baseUrl: process.env.EVOLUTION_BASE_URL || "",
     instance: process.env.EVOLUTION_INSTANCE || "",
     token: process.env.EVOLUTION_TOKEN || "",
+  },
+  gemini: {
+    apiKey: process.env.GEMINI_API_KEY | ""
   },
   botAllowedNumbers: parseWhitelist(process.env.BOT_ALLOWED_NUMBERS || ""),
 };
